@@ -1,0 +1,38 @@
+[package]
+name = "teeter"
+version = "0.1.0"
+edition = "2021"
+description = "teeter - a custom Vulkan MilkDrop-style feedback visualizer for the ROG Ally"
+license = "MIT"
+
+[dependencies]
+# windowing / event loop
+winit = { version = "0.30.13", features = ["rwh_06"] }
+
+# Vulkan bindings (classic builder API). The Win32 surface is created
+# manually from the winit raw window handle, so we don't need ash-window.
+ash = "0.37"
+
+# math
+glam = "0.29"
+
+# logging
+log = "0.4"
+env_logger = "0.11"
+
+# gamepad input
+gilrs = "0.10"
+
+# audio capture (WASAPI loopback on Windows) + FFT
+wasapi = "0.24"
+rustfft = "6"
+
+# the live DSP synth engine (trip-engine crate on disk)
+trip-engine = { path = "../trip-engine" }
+
+# realtime audio output for the synth
+cpal = "0.15"
+
+[profile.release]
+opt-level = 3
+lto = "thin"

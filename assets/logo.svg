@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <radialGradient id="glow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%"  stop-color="#18f2e2" stop-opacity="0.55"/>
+      <stop offset="45%" stop-color="#0a9d92" stop-opacity="0.22"/>
+      <stop offset="100%" stop-color="#05090c" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="panel" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%"  stop-color="#4cfff1"/>
+      <stop offset="55%" stop-color="#15c9ba"/>
+      <stop offset="100%" stop-color="#067d74"/>
+    </linearGradient>
+  </defs>
+
+  <!-- background field -->
+  <rect width="512" height="512" fill="#05090c"/>
+
+  <!-- ambient glow (void-teal) -->
+  <circle cx="256" cy="266" r="216" fill="url(#glow)"/>
+
+  <g transform="translate(256 268)">
+    <!-- feedback echoes: three translucent copies trailing the tilt -->
+    <g opacity="0.16" transform="translate(60 10) rotate(24)">
+      <rect x="-88" y="-88" width="176" height="176" rx="36" fill="none" stroke="#18f2e2" stroke-width="8"/>
+    </g>
+    <g opacity="0.30" transform="translate(36 6) rotate(16)">
+      <rect x="-88" y="-88" width="176" height="176" rx="36" fill="none" stroke="#22e9d8" stroke-width="8"/>
+    </g>
+    <g opacity="0.55" transform="translate(16 2) rotate(8)">
+      <rect x="-88" y="-88" width="176" height="176" rx="36" fill="none" stroke="#31e5d4" stroke-width="8"/>
+    </g>
+
+    <!-- the "teeter" panel, tilted on its pivot -->
+    <g transform="rotate(-16)">
+      <rect x="-88" y="-88" width="176" height="176" rx="36"
+            fill="#0a2a2b" stroke="url(#panel)" stroke-width="9"/>
+      <!-- glitch notch: a small slice cutting across the panel -->
+      <path d="M -30 -88 L -8 88" stroke="#05090c" stroke-width="7" opacity="0.9"/>
+      <path d="M -46 -88 L -24 88" stroke="#18f2e2" stroke-width="4" opacity="0.5"/>
+    </g>
+
+    <!-- glowing pivot point the panel balances on -->
+    <circle cx="0" cy="104" r="16" fill="#05090c" stroke="#5affee" stroke-width="7"/>
+    <circle cx="0" cy="104" r="5" fill="#b7fff8"/>
+    <!-- pivot halo -->
+    <circle cx="0" cy="104" r="34" fill="none" stroke="#18f2e2" stroke-width="2" opacity="0.45"/>
+  </g>
+
+  <!-- crisp baseline pulse beneath the pivot -->
+  <ellipse cx="256" cy="384" rx="72" ry="10" fill="#18f2e2" opacity="0.28"/>
+</svg>

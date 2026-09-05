@@ -1,0 +1,7 @@
+/target
+/shaders/spv
+*.wav
+# generated from assets/logo.svg by the build; embedded via include_bytes!
+/assets/logo.rgba
+__pycache__/
+*.pyc
