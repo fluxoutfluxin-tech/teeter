@@ -1,6 +1,6 @@
 #version 450
 
-// "Vortex gyre" — a tight rotational swirl that folds the plane back on itself.
+// "Vortex gyre" â€” a tight rotational swirl that folds the plane back on itself.
 //
 // Same descriptor contract as warp.frag (set 0: UBO binding 0, texPrev
 // binding 1, aspect in the uniform block), so it plugs into the existing
@@ -11,7 +11,7 @@
 // the tail wraps around the front. Bass and the rotate knob spin the gyre
 // harder; mid folds wavy bands into it, and the beat pulses the point-eye at
 // the center. Distinct from warp3's three-fold fold and warp1's sinusoidal
-// wobble — this one is a single omnidirectional vortex.
+// wobble â€” this one is a single omnidirectional vortex.
 
 #include "teeter_common.h"
 
@@ -101,5 +101,6 @@ void main() {
     // Filmic finish: preserves detail, tames highlights (no flat white).
     float energy = clamp(0.84*u.bass + 0.24*u.mid + 0.24*u.treble + 0.66*u.beat, 0.0, 1.0);
     shifted = teeter_colorize(shifted, energy);
+    shifted = teeter_crossfade(shifted, tex, u.dissolve);
     outColor = vec4(shifted, 1.0);
 }

@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "teeter - a custom Vulkan MilkDrop-style feedback visualizer for the ROG Ally"
 license = "MIT"
+authors = ["Dru Doney Jones"]
 
 [dependencies]
 # windowing / event loop
@@ -24,7 +25,6 @@ env_logger = "0.11"
 gilrs = "0.10"
 
 # audio capture (WASAPI loopback on Windows) + FFT
-wasapi = "0.24"
 rustfft = "6"
 
 # the live DSP synth engine (trip-engine crate on disk)

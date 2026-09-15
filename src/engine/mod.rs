@@ -20,6 +20,13 @@ pub struct FrameUniforms {
     pub dissolve: f32,
     pub palette: f32,
     pub preset_seed: f32,
+    /// Extended audio shape features (added after `aspect` so old warps that
+    /// only declare the first 13 floats stay layout-compatible).
+    pub sub_bass: f32,
+    pub centroid: f32,
+    pub crest: f32,
+    pub flux: f32,
+    pub rolloff: f32,
 }
 
 impl Default for FrameUniforms {
@@ -37,6 +44,11 @@ impl Default for FrameUniforms {
             dissolve: 0.0,
             palette: 0.0,
             preset_seed: 0.0,
+            sub_bass: 0.0,
+            centroid: 0.5,
+            crest: 0.0,
+            flux: 0.0,
+            rolloff: 0.5,
         }
     }
 }
@@ -88,13 +100,16 @@ impl EngineState {
         // genre / energy / tempo, so the visuals shift character with the music.
         let (auto_zoom_speed, auto_warp, auto_dissolve, palette_drift) = self.genre_motion(audio, t);
 
-        // Zoom: breathing by energy + a jump on every beat.
-        let auto_zoom = auto_zoom_speed * (0.25 + 0.75 * audio.energy) + beat * 0.55;
+        // Zoom: breathing by energy + a jump on every beat + a nudge from
+        // spectral flux so transients visibly pulse.
+        let auto_zoom = auto_zoom_speed * (0.25 + 0.75 * audio.energy) + beat * 0.55 + audio.flux * 0.25;
         // Warp: genre-scaled traveling waves (x*cos + y*sin Lissajous).
         let auto_wx = auto_warp * (0.6 * (t * 0.9).sin() + 0.4 * (t * 2.3).sin());
         let auto_wy = auto_warp * (0.6 * (t * 1.1).cos() + 0.4 * (t * 2.7).cos());
         let auto_rot = auto_warp * 0.3 * (t * 0.5).sin();
-        let auto_palette = (t * palette_drift).rem_euclid(1.0);
+        // Palette drift rate leans brighter tracks toward faster color cycling.
+        let drift = palette_drift * (0.7 + 0.6 * audio.centroid);
+        let auto_palette = (t * drift).rem_euclid(1.0);
 
         // Blend: manual input wins when the player actively moves it,
         // otherwise the music drives. 1.0 = full manual, 0 = full auto.
@@ -115,12 +130,17 @@ impl EngineState {
             treble: audio.treble,
             beat,
             zoom,
-            warp_x,
-            warp_y,
+            warp_x: warp_x,
+            warp_y: warp_y,
             rotate,
             dissolve,
             palette,
             preset_seed: self.preset_seed,
+            sub_bass: audio.sub_bass,
+            centroid: audio.centroid,
+            crest: audio.crest,
+            flux: audio.flux,
+            rolloff: audio.rolloff,
         }
     }
 
@@ -149,6 +169,20 @@ impl EngineState {
     pub fn next_preset(&mut self) {
         self.preset_index = self.preset_index.wrapping_add(1);
         self.preset_seed = seed_for_preset(self.preset_index);
+        self.beat_pulse = 1.0;
+    }
+
+    /// Re-seed on shader change so each warp gets a fresh color character.
+    pub fn reshuffle_seed(&mut self) {
+        self.preset_index = self.preset_index.wrapping_add(1);
+        self.preset_seed = seed_for_preset(self.preset_index);
+        self.beat_pulse = 1.0;
+    }
+
+    /// Jump directly to a given preset index (used by --preset CLI arg).
+    pub fn set_preset(&mut self, idx: u32) {
+        self.preset_index = idx;
+        self.preset_seed = seed_for_preset(idx);
         self.beat_pulse = 1.0;
     }
 }

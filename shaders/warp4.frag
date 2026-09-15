@@ -1,6 +1,6 @@
 #version 450
 
-// "Mirror bloom" — a 4-fold kaleidoscope of mirrored wedges.
+// "Mirror bloom" â€” a 4-fold kaleidoscope of mirrored wedges.
 //
 // Same descriptor contract as warp.frag (set 0: UBO binding 0, texPrev
 // binding 1, aspect in the uniform block), so it plugs into the existing
@@ -98,5 +98,6 @@ void main() {
     // Filmic finish: preserves detail, tames highlights (no flat white).
     float energy = clamp(0.84*u.bass + 0.24*u.mid + 0.24*u.treble + 0.66*u.beat, 0.0, 1.0);
     shifted = teeter_colorize(shifted, energy);
+    shifted = teeter_crossfade(shifted, tex, u.dissolve);
     outColor = vec4(shifted, 1.0);
 }

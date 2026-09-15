@@ -1,10 +1,12 @@
-//! Audio analysis via WASAPI loopback capture.
+//! Audio analysis driven by the trip-engine live synth.
 //!
-//! Grabs the system's audio output ("what you hear") using a WASAPI loopback
-//! stream on a background thread, downmixes to mono, and fills a small ring of
-//! recent samples. The renderer calls [`LoopbackAudio::current_frame`] each
-//! frame, which runs a windowed FFT over that ring to produce the
-//! [`AudioFrame`] band energies + a beat-onset pulse.
+//! The app runs a single realtime pipeline: the trip-engine [`Synth`] plays
+//! through the speakers on a cpal output thread while a WASAPI loopback stream
+//! (via `trip_engine::Loopback`) captures whatever else the system plays. A
+//! [`Blender`] EQ's both layers, mixes them, and tees the blended stereo into a
+//! shared ring. The renderer calls [`AudioAnalyzer::current_frame`] each frame,
+//! which runs a windowed FFT over that ring to produce the [`AudioFrame`] band
+//! energies + a beat-onset pulse.
 //!
 //! The loops are deliberately decoupled: the capture thread never blocks on
 //! the renderer and vice-versa, so neither can starve the other.
@@ -52,6 +54,16 @@ pub struct AudioFrame {
     pub energy: f32,
     /// Rolling beat-frequency estimate 0..1 (0 = sparse/ambient, 1 = fast).
     pub tempo: f32,
+    /// Sub-bass band (20-80 Hz), same 0..1 dB-mapped scale as `bass`.
+    pub sub_bass: f32,
+    /// Spectral centroid, 0 = deep/bass-heavy, 1 = bright/high-end.
+    pub centroid: f32,
+    /// Spectral crest factor (peak/mean of the spectrum), 0..1 peaking.
+    pub crest: f32,
+    /// Spectral-flux proxy: frame-to-frame band novelty 0..1 (rises on hits).
+    pub flux: f32,
+    /// Rolloff frequency (85% of energy below), normalized 0..1 by Nyquist.
+    pub rolloff: f32,
 }
 
 /// A minimal capture/analyzer trait so the renderer never needs to know the
@@ -106,8 +118,6 @@ struct Shared {
     beat: Mutex<BeatState>,
     /// Sample rate reported by the capture endpoint.
     sample_rate: AtomicU32,
-    /// Set to stop the capture thread.
-    stop: AtomicBool,
 }
 impl Shared {
     fn new() -> Self {
@@ -116,49 +126,7 @@ impl Shared {
             frame: RwLock::new(AudioFrame::default()),
             beat: Mutex::new(BeatState::default()),
             sample_rate: AtomicU32::new(48000),
-            stop: AtomicBool::new(false),
         }
-    }
-}
-
-/// WASAPI loopback analyzer.
-pub struct LoopbackAudio {
-    shared: Option<Arc<Shared>>,
-    handle: Option<thread::JoinHandle<()>>,
-    idle: Cell<f32>,
-}
-
-impl Default for LoopbackAudio {
-    fn default() -> Self {
-        Self { shared: None, handle: None, idle: Cell::new(0.0) }
-    }
-}
-
-impl AudioAnalyzer for LoopbackAudio {
-    fn start(&mut self) -> Result<(), String> {
-        if self.shared.is_some() {
-            return Ok(()); // already running
-        }
-        let shared = Arc::new(Shared::new());
-        let cap = Arc::clone(&shared);
-        let handle = thread::Builder::new()
-            .name("teeter-loopback".to_string())
-            .spawn(move || {
-                if let Err(e) = capture_loop(&cap) {
-                    log::warn!("loopback capture stopped: {e}");
-                }
-            })
-            .map_err(|e| format!("spawn capture thread: {e}"))?;
-        self.shared = Some(shared);
-        self.handle = Some(handle);
-        Ok(())
-    }
-
-    fn current_frame(&self) -> AudioFrame {
-        let Some(shared) = &self.shared else {
-            return idle_frame(&self.idle); // not started yet: gentle idle
-        };
-        frame_from_shared(shared, &self.idle)
     }
 }
 
@@ -217,15 +185,13 @@ impl Default for SynthAudio {
     }
 }
 
-impl SynthAudio {
+impl AudioAnalyzer for SynthAudio {
     /// Cloneable handle the UI thread can use to switch presets / adjust the
     /// live synth controls. Only available after [`start`](AudioAnalyzer::start).
-    pub fn handle(&self) -> Option<SynthHandle> {
+    fn handle(&self) -> Option<SynthHandle> {
         self.handle.clone()
     }
-}
 
-impl AudioAnalyzer for SynthAudio {
     fn start(&mut self) -> Result<(), String> {
         if self.shared.is_some() {
             return Ok(()); // already running
@@ -534,6 +500,11 @@ fn idle_frame(t: &Cell<f32>) -> AudioFrame {
         genre: Genre::Ambient,
         energy: 0.3,
         tempo: 0.2,
+        sub_bass: 0.25,
+        centroid: 0.4,
+        crest: 0.2,
+        flux: 0.05,
+        rolloff: 0.3,
     }
 }
 
@@ -637,6 +608,7 @@ fn analyze(
             band_mag(180.0, 3800.0),
             band_mag(2200.0, 16000.0),
         );
+        let sub_mag = band_mag(20.0, 80.0);
 
         // Calibration: reveal the raw band dB range once so DB_FLOOR/DB_CEIL can
         // be tuned against real signal levels.
@@ -649,14 +621,66 @@ fn analyze(
         };
         let raw = (map(mags.0), map(mags.1), map(mags.2));
 
+        // --- Spectral shape descriptors -------------------------------------
+        // Centroid/crest/rolloff are *shape* measures (ratios), so the raw
+        // complex magnitudes work directly without the dB window normalization.
+        let nyq_bin = FFT_SIZE / 2;
+        let mut mag_sum = 0.0f32;
+        let mut weighted = 0.0f32;
+        let mut peak_mag = 0.0f32;
+        for k in 1..=nyq_bin {
+            let m = buffer[k].norm();
+            mag_sum += m;
+            weighted += m * k as f32;
+            peak_mag = peak_mag.max(m);
+        }
+        let centroid = if mag_sum > 1e-9 {
+            (weighted / mag_sum) / nyq_bin as f32
+        } else {
+            0.5
+        };
+        let mean_mag = mag_sum / nyq_bin as f32;
+        let crest = if mean_mag > 1e-9 {
+            ((peak_mag / mean_mag) - 1.0).min(9.0) / 9.0
+        } else {
+            0.0
+        };
+        let rolloff = if mag_sum > 1e-9 {
+            let target = mag_sum * 0.85;
+            let mut acc = 0.0f32;
+            let mut rr = 0.5f32;
+            for k in 1..=nyq_bin {
+                acc += buffer[k].norm();
+                if acc >= target {
+                    rr = k as f32 / nyq_bin as f32;
+                    break;
+                }
+            }
+            rr
+        } else {
+            0.5
+        };
+
         // Attack/release smoothing: rise fast on a transient, fall slowly — keeps
-        // the motion punchy yet stable (no per-frame flicker).
+        // the motion punchy yet stable (no per-frame flicker). Shape measures get
+        // gentler one-pole smoothing.
         let sm = |target: f32, v: f32| v + (if target > v { ATTACK } else { RELEASE }) * (target - v);
         let frame = (
             sm(raw.0, prev.bass),
             sm(raw.1, prev.mid),
             sm(raw.2, prev.treble),
         );
+        let sub = sm(map(sub_mag), prev.sub_bass);
+        let centroid = prev.centroid + (centroid - prev.centroid) * 0.18;
+        let crest = prev.crest + (crest - prev.crest) * 0.30;
+        let rolloff = prev.rolloff + (rolloff - prev.rolloff) * 0.15;
+        // Spectral-flux proxy: frame-to-frame novelty of the smoothed bands,
+        // scaled so a full swing approaches 1.
+        let flux_raw =
+            (frame.0 - prev.bass).abs() + (frame.1 - prev.mid).abs()
+                + (frame.2 - prev.treble).abs();
+        let flux = sm((flux_raw * 3.0).min(1.0), prev.flux);
+        let frame = (frame.0, frame.1, frame.2);
 
         let beat = onset_pulse(beat_shared, frame.0, frame.1);
 
@@ -684,7 +708,20 @@ fn analyze(
         let energy = prev.energy + (energy - prev.energy) * 0.1;
 
         log_genre_change(prev.genre, genre);
-        AudioFrame { bass: frame.0, mid: frame.1, treble: frame.2, beat, genre, energy, tempo }
+        AudioFrame {
+            bass: frame.0,
+            mid: frame.1,
+            treble: frame.2,
+            beat,
+            genre,
+            energy,
+            tempo,
+            sub_bass: sub,
+            centroid,
+            crest,
+            flux,
+            rolloff,
+        }
     })
 }
 
@@ -795,118 +832,4 @@ fn onset_pulse(beat_shared: &Mutex<BeatState>, bass: f32, mid: f32) -> f32 {
     b.baseline = b.baseline * 0.92 + energy * 0.08;
     b.pulse = pulse;
     pulse
-}
-
-/// The capture thread: opens a WASAPI loopback stream on the default render
-/// device, reads frames, downmixes to mono, and feeds the shared ring.
-fn capture_loop(shared: &Arc<Shared>) -> Result<(), String> {
-    use wasapi::*;
-
-    if wasapi::initialize_mta().is_err() {
-        return Err("COM initialization failed".to_string());
-    }
-
-    let enumerator = DeviceEnumerator::new().map_err(|e| format!("device enumerator: {e}"))?;
-    let device = enumerator
-        .get_default_device(&Direction::Render)
-        .map_err(|e| format!("no default render device: {e}"))?;
-
-    let audio_client = device.get_iaudioclient().map_err(|e| format!("audio client: {e}"))?;
-    let mut audio_client = audio_client;
-
-    // Use the device's native mix format (float, valid bits) + sample rate.
-    let native_rate = {
-        let mixfmt = audio_client.get_mixformat().map_err(|e| format!("mix format: {e}"))?;
-        log::info!(
-            "loopback: render device mix format: {}Hz, {}ch, {}-bit",
-            mixfmt.get_samplespersec(),
-            mixfmt.get_nchannels(),
-            mixfmt.get_bitspersample()
-        );
-        mixfmt.get_samplespersec()
-    };
-    shared.sample_rate.store(native_rate, Ordering::Relaxed);
-
-    // Request float32 stereo at the native rate; autoconvert lets WASAPI
-    // resample in the engine's actual mix format.
-    let format = WaveFormat::new(32, 32, &SampleType::Float, native_rate as usize, 2, None);
-    let blockalign = format.get_blockalign() as usize;
-
-    // Continuous capture: we request shared/event mode with autoconvert so
-    // WASAPI resamples the engine's mix to our float32 stereo format.
-
-    let (_def_time, min_time) = audio_client.get_device_period().map_err(|e| format!("period: {e}"))?;
-
-    // Loopback: a *render* device's client opened for *capture* in shared mode
-    // sets AUDCLNT_STREAMFLAGS_LOOPBACK automatically.
-    let mode = StreamMode::EventsShared { autoconvert: true, buffer_duration_hns: min_time };
-    audio_client
-        .initialize_client(&format, &Direction::Capture, &mode)
-        .map_err(|e| format!("initialize loopback: {e}"))?;
-
-    let h_event = audio_client.set_get_eventhandle().map_err(|e| format!("event handle: {e}"))?;
-    let capture_client = audio_client.get_audiocaptureclient().map_err(|e| format!("capture client: {e}"))?;
-
-    // Read up to buffer_size frames per event in a reusable buffer.
-    let buf_frames = audio_client.get_buffer_size().map_err(|e| format!("buffer size: {e}"))? as usize;
-    let read_frames = buf_frames.max(512);
-    let mut buf = vec![0u8; read_frames * blockalign];
-
-    audio_client.start_stream().map_err(|e| format!("start stream: {e}"))?;
-
-    // Capture frame bytes -> mono f32. Format is float32 interleaved per the
-    // request above (autoconvert guarantees float32).
-    let channels = 2usize;
-    let mut frame_count: u64 = 0;
-    let mut last_log = std::time::Instant::now();
-    loop {
-        if shared.stop.load(Ordering::Relaxed) {
-            break;
-        }
-        // Event-driven stream: the handle signals when new data is ready. A
-        // timeout is NORMAL (audio arrives in bursts), so only treat it as a
-        // watchdog and keep looping — never kill the thread on a timeout.
-        if h_event.wait_for_event(1000).is_err() {
-            continue;
-        }
-        // Drain whatever is available.
-        loop {
-            let nframes = match capture_client.read_from_device(&mut buf) {
-                Ok((n, _info)) => n,
-                Err(WasapiError::DataLengthTooShort { .. }) => break,
-                Err(_) => {
-                    // Transient; keep the stream alive and try again.
-                    break;
-                }
-            };
-            if nframes == 0 {
-                break;
-            }
-            let bytes = nframes as usize * blockalign;
-            let samples = bytes / std::mem::size_of::<f32>() / channels;
-            frame_count += nframes as u64;
-            if last_log.elapsed().as_millis() >= 2000 {
-                log::info!("loopback: captured {} frames so far", frame_count);
-                last_log = std::time::Instant::now();
-            }
-            let mut ring = shared.ring.lock().unwrap();
-            for s in 0..samples {
-                let base = s * channels * std::mem::size_of::<f32>();
-                let l = f32::from_le_bytes(buf[base..base + 4].try_into().unwrap());
-                let r = f32::from_le_bytes(buf[base + 4..base + 8].try_into().unwrap());
-                ring.push_back(0.5 * (l + r));
-            }
-            while ring.len() > RING_MAX {
-                ring.pop_front();
-            }
-            drop(ring);
-            // If we under-read, there may be more frames available.
-            if nframes < read_frames as u32 {
-                break;
-            }
-        }
-    }
-
-    let _ = audio_client.stop_stream();
-    Ok(())
 }

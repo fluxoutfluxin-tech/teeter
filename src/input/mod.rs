@@ -4,7 +4,9 @@
 //! Mapping (ROG Ally controller, Xbox layout):
 //!   - Left stick  Y -> warp_y,  X -> warp_x
 //!   - Right stick X -> rotate,    Y -> zoom
-//!   - LB / RB / D-pad L/R / triggers -> palette shift (manual color cycle)
+//!   - LB / RB / D-pad L/R -> palette shift
+//!   - Left trigger (analog)  -> dissolve (plus palette nudge fallback)
+//!   - Right trigger (analog) -> synth master gain
 //!   - A (South)      -> next preset
 //!   - B (East)       -> next warp shader
 //!   - Touch: swipe = warp tilt, pinch = zoom, tap = next preset (Stage 3)
@@ -25,6 +27,8 @@ pub struct InputState {
     /// Rising edges requesting more/less live system-audio blend (D-pad up/down).
     pub live_mix_inc_edge: bool,
     pub live_mix_dec_edge: bool,
+    /// Toggle 5-cell wireframe overlay (West / X button).
+    pub fivecell_toggle_edge: bool,
     /// Synth master gain axis 0..1 (right trigger analog).
     pub master_axis: f32,
 }
@@ -43,6 +47,7 @@ impl Default for InputState {
             toggle_fullscreen_edge: false,
             live_mix_inc_edge: false,
             live_mix_dec_edge: false,
+            fivecell_toggle_edge: false,
             master_axis: 0.0,        }
     }
 }
@@ -51,9 +56,8 @@ impl Default for InputState {
 pub struct Controller {
     pub gilrs: Gilrs,
     pub state: InputState,
-    // Rising-edge latches so a held trigger axis nudges the palette once.
+    // Rising-edge latch so a held left trigger nudges the palette once.
     lt_was_high: bool,
-    rt_was_high: bool,
 }
 
 impl Controller {
@@ -66,7 +70,6 @@ impl Controller {
             gilrs: gilrs.expect("failed to init gilrs (no gamepad backend)"),
             state: InputState::default(),
             lt_was_high: false,
-            rt_was_high: false,
         }
     }
 
@@ -77,6 +80,7 @@ impl Controller {
         self.state.toggle_fullscreen_edge = false;
         self.state.live_mix_inc_edge = false;
         self.state.live_mix_dec_edge = false;
+        self.state.fivecell_toggle_edge = false;
 
         while let Some(event) = self.gilrs.next_event() {
             use gilrs::EventType;
@@ -105,6 +109,8 @@ impl Controller {
                         }
                         // Start / Menu toggles fullscreen.
                         gilrs::Button::Start => self.state.toggle_fullscreen_edge = true,
+                        // West (X) toggles the 5-cell wireframe overlay.
+                        gilrs::Button::West => self.state.fivecell_toggle_edge = true,
                         // D-pad up/down adjust the live system-audio blend level.
                         gilrs::Button::DPadUp => self.state.live_mix_inc_edge = true,
                         gilrs::Button::DPadDown => self.state.live_mix_dec_edge = true,
@@ -132,13 +138,9 @@ impl Controller {
                             self.lt_was_high = high;
                         }
                         gilrs::Axis::RightZ => {
-                            self.state.dissolve = v.clamp(0.0, 1.0);
-                            let high = v > 0.5;
-                            if high && !self.rt_was_high {
-                                self.state.palette = (self.state.palette + 0.15).rem_euclid(1.0);
-                                log::info!("input: palette -> {:.2}", self.state.palette);
-                            }
-                            self.rt_was_high = high;
+                            // Right trigger = synth master gain (0..1). The app
+                            // pokes it into the trip-engine control snapshot.
+                            self.state.master_axis = v;
                         }
                         _ => {}
                     }

@@ -2,6 +2,8 @@
 
 > a custom Vulkan MilkDrop-style feedback visualizer for the ASUS ROG Ally.
 
+**Concept & Design:** Dru Mitchell Gary Doney Jones
+
 teeter is a realtime, GPU-accelerated music visualizer. It captures live
 system audio (WASAPI loopback) and runs it through an FFT to drive a stack of
 feedback-warp fragment shaders — all rendered at fullscreen on the ROG Ally's
@@ -13,8 +15,10 @@ feedback-warp fragment shaders — all rendered at fullscreen on the ROG Ally's
 
 ## Features
 
-- **13 warp shaders** — classic MilkDrop-style feedback warps (`warp.frag` …
-  `warp13.frag`), cycled live from the controller
+- **20 warp shaders** — classic MilkDrop-style feedback warps (`warp.frag` …
+  `warp20.frag`), cycled live from the controller
+- **5-cell overlay** — an audio-rotated regular pentachoron (4-simplex)
+  projected 4D→3D and rendered as an additive wireframe over the warps
 - **Live audio-reactive DSP** — WASAPI loopback capture + FFT spectrum driving
   shader uniforms
 - **Synthesized companion audio** — a live DSP synth engine (`trip-engine`)
@@ -64,9 +68,10 @@ teeter/
 │   ├── app.rs          # app state + frame loop
 │   ├── audio/          # WASAPI loopback capture + FFT + EQ
 │   ├── engine/         # feedback engine run-time state
+│   ├── fivecell.rs     # 5-cell (pentachoron) geometry + DSP UBO
 │   ├── input/          # gamepad + touch → navigation state
 │   └── vulkan/         # Vulkan pipeline, renderer, shader stage setup
-├── shaders/            # GLSL warps + feedback/composite stages
+├── shaders/            # GLSL warps + 5-cell projection + feedback stages
 ├── scripts/            # logo / icon generators
 ├── assets/             # logo + icon
 └── build.ps1           # shader compile + cargo build

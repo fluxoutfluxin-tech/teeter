@@ -77,15 +77,6 @@ impl EqChannel {
         c
     }
 
-    /// Set the sample rate and recompute coefficients (call on init).
-    pub fn set_sample_rate(&mut self, rate: u32) {
-        if self.sample_rate == rate as f64 {
-            return;
-        }
-        self.sample_rate = rate as f64;
-        self.recompute();
-    }
-
     /// Update a band gain in dB and recompute that coefficient set.
     pub fn set_gains(&mut self, gains: EqGains) {
         self.gains = gains;

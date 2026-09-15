@@ -1,6 +1,6 @@
 #version 450
 
-// "Ripple pool" — concentric circular ripples radiating from a bass-pulsed
+// "Ripple pool" â€” concentric circular ripples radiating from a bass-pulsed
 // epicentre, with mid-driven interference rings.
 //
 // Same descriptor contract as warp.frag (set 0 binding 0 = UBO, binding 1 =
@@ -10,7 +10,7 @@
 // with sine waves, so the previous frame congeals into a pond of expanding
 // rings. Bass pulses the ring spacing (a fresh plunk on the beat), mid adds
 // angular ripples around the circumference, and the centre glows like a new
-// drop landing. Distinct from warp8 (a polar tube you fly down) — here the
+// drop landing. Distinct from warp8 (a polar tube you fly down) â€” here the
 // rings are the star and they bloom outward, not march forward.
 
 #include "teeter_common.h"
@@ -89,5 +89,6 @@ void main() {
     // Filmic finish: preserves detail, tames highlights (no flat white).
     float energy = clamp(0.84*u.bass + 0.24*u.mid + 0.24*u.treble + 0.66*u.beat, 0.0, 1.0);
     shifted = teeter_colorize(shifted, energy);
+    shifted = teeter_crossfade(shifted, tex, u.dissolve);
     outColor = vec4(shifted, 1.0);
 }

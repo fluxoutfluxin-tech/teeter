@@ -24,6 +24,7 @@ use winit::window::Window;
 
 use crate::audio::AudioFrame;
 use crate::engine::EngineState;
+use crate::fivecell::{self, DSPUniforms};
 use crate::input::InputState;
 
 // SPIR-V blobs (produced by the Vulkan SDK glslc, committed at build time).
@@ -41,6 +42,35 @@ const WARP10_SPV: &[u8] = include_bytes!("../../shaders/spv/warp10.frag.spv");
 const WARP11_SPV: &[u8] = include_bytes!("../../shaders/spv/warp11.frag.spv");
 const WARP12_SPV: &[u8] = include_bytes!("../../shaders/spv/warp12.frag.spv");
 const WARP13_SPV: &[u8] = include_bytes!("../../shaders/spv/warp13.frag.spv");
+const WARP14_SPV: &[u8] = include_bytes!("../../shaders/spv/warp14.frag.spv");
+const WARP15_SPV: &[u8] = include_bytes!("../../shaders/spv/warp15.frag.spv");
+const WARP16_SPV: &[u8] = include_bytes!("../../shaders/spv/warp16.frag.spv");
+const WARP17_SPV: &[u8] = include_bytes!("../../shaders/spv/warp17.frag.spv");
+const WARP18_SPV: &[u8] = include_bytes!("../../shaders/spv/warp18.frag.spv");
+const WARP19_SPV: &[u8] = include_bytes!("../../shaders/spv/warp19.frag.spv");
+const WARP20_SPV: &[u8] = include_bytes!("../../shaders/spv/warp20.frag.spv");
+
+// 5-cell overlay shaders (own pipeline with a separate DSPUniforms UBO).
+const CELL_VERT_SPV: &[u8] = include_bytes!("../../shaders/spv/5cell_projection.vert.spv");
+const CELL_FRAG_SPV: &[u8] = include_bytes!("../../shaders/spv/5cell_render.frag.spv");
+
+/// Display metadata for the numbered warp shaders, indexed same as the
+/// pipeline array (warp.frag = 0 .. warp20.frag = 19). The first 13 classic
+/// shaders predate named presets, so they return `None` and the UI falls back
+/// to a plain "warp N" tag; the newer high-polygon geometric warps get names
+/// and a visual genre for the title bar.
+pub fn warp_meta(idx: usize) -> Option<(&'static str, &'static str)> {
+    match idx {
+        13 => Some(("kaleido mandala", "sacred geometry")),
+        14 => Some(("hex lattice", "geometric")),
+        15 => Some(("crystal pillars", "crystalline")),
+        16 => Some(("interference moiré", "optical")),
+        17 => Some(("star mandala", "sacred geometry")),
+        18 => Some(("infinite staircase", "surreal")),
+        19 => Some(("lowpoly shards", "chromatic")),
+        _ => None,
+    }
+}
 
 /// Number of frames we keep in flight (command buffers + sync objects).
 /// This is deliberately independent of the swapchain image count so that
@@ -48,8 +78,9 @@ const WARP13_SPV: &[u8] = include_bytes!("../../shaders/spv/warp13.frag.spv");
 /// per-frame arrays at a stale size.
 const MAX_FRAMES_IN_FLIGHT: usize = 2;
 
-/// Must match the `FrameUniforms` block in the shaders (12 floats = 48 bytes)
-/// plus aspect.
+/// Must match the `FrameUniforms` block in the shaders (13 floats = 52 bytes)
+/// plus the extended audio shape features appended AFTER `aspect` so old warps
+/// that only declare the first 13 floats stay layout-compatible.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct UniformData {
@@ -66,6 +97,12 @@ struct UniformData {
     palette: f32,
     preset_seed: f32,
     aspect: f32,
+    // Extended audio shape descriptors (new warps read these; old ones don't).
+    sub_bass: f32,
+    centroid: f32,
+    crest: f32,
+    flux: f32,
+    rolloff: f32,
 }
 
 fn cstring(s: &str) -> CString {
@@ -89,25 +126,44 @@ pub struct Renderer {
 
     device: ash::Device,
     graphics_queue: vk::Queue,
-    queue_family_index: u32,
 
     // feedback texture ("previous frame")
     feedback_image: vk::Image,
     feedback_memory: vk::DeviceMemory,
     feedback_view: vk::ImageView,
     feedback_sampler: vk::Sampler,
+    // frozen pre-switch copy for the warp crossfade (texOld, binding 2)
+    feedback_old_image: vk::Image,
+    feedback_old_memory: vk::DeviceMemory,
+    feedback_old_view: vk::ImageView,
+    /// Crossfade dissolve override: 0 normally, spiked to 1.0 on a warp switch
+    /// and decayed each frame so switching melts instead of cutting.
+    crossfade: f32,
+    /// Copy the current feedback frame into `feedback_old` on the next render
+    /// (set when the warp changes, so texOld captures the pre-switch look).
+    freeze_pending: bool,
 
     render_pass: vk::RenderPass,
     pipeline_layout: vk::PipelineLayout,
     /// One pipeline per selectable warp shader.
     pipelines: Vec<vk::Pipeline>,
     shader_index: usize,
-    desc_set_layout: vk::DescriptorSetLayout,
-    desc_pool: vk::DescriptorPool,
     desc_set: vk::DescriptorSet,
-    uniform_buffer: vk::Buffer,
     uniform_memory: vk::DeviceMemory,
     uniform_size: vk::DeviceSize,
+
+    // 5-cell wireframe overlay (own pipeline, descriptor set + buffers).
+    fivecell_pipeline: vk::Pipeline,
+    fivecell_pipeline_layout: vk::PipelineLayout,
+    fivecell_desc_set: vk::DescriptorSet,
+    fivecell_vertex_buffer: vk::Buffer,
+    fivecell_vertex_memory: vk::DeviceMemory,
+    fivecell_index_buffer: vk::Buffer,
+    fivecell_index_memory: vk::DeviceMemory,
+    fivecell_uniform_buffer: vk::Buffer,
+    fivecell_uniform_memory: vk::DeviceMemory,
+    fivecell_uniform_size: vk::DeviceSize,
+    fivecell_active: bool,
 
     command_pool: vk::CommandPool,
     command_buffers: Vec<vk::CommandBuffer>,
@@ -279,6 +335,16 @@ impl Renderer {
             )?
         };
         let feedback_sampler = unsafe { create_sampler(&device)? };
+        // Frozen pre-switch copy for the warp crossfade (sampled as texOld).
+        let (feedback_old_image, feedback_old_memory, feedback_old_view) = unsafe {
+            create_image(
+                &device,
+                instance.get_physical_device_memory_properties(physical_device),
+                extent,
+                format,
+                vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
+            )?
+        };
 
         // --- Pipeline (single: warp.frag -> swapchain) ----------------------
         let desc_set_layout = unsafe {
@@ -286,6 +352,7 @@ impl Renderer {
                 &device,
                 ubo_binding(),
                 feedback_binding(),
+                tex_old_binding(),
             )?
         };
         let pipeline_layout = unsafe {
@@ -296,13 +363,43 @@ impl Renderer {
                 )
                 .map_err(|e| format!("pipeline layout: {e}"))?
         };
+        // The 5-cell overlay uses its own UBO-only layout (DSPUniforms block,
+        // different layout from the warp FrameUniforms).
+        let fivecell_desc_set_layout = unsafe {
+            create_desc_set_layout_ubo_only(&device, ubo_binding())?
+        };
+        let fivecell_pipeline_layout = unsafe {
+            device
+                .create_pipeline_layout(
+                    &vk::PipelineLayoutCreateInfo::builder()
+                        .set_layouts(&[fivecell_desc_set_layout]),
+                    None,
+                )
+                .map_err(|e| format!("5-cell pipeline layout: {e}"))?
+        };
         // Build one pipeline per selectable warp shader (same layout/render
         // pass, different fragment shader). They share the descriptor layout,
         // so the desc_set stays valid across all of them.
-        let mut pipelines = Vec::with_capacity(13);
-        for frag in [WARP_SPV, WARP2_SPV, WARP3_SPV, WARP4_SPV, WARP5_SPV, WARP6_SPV, WARP7_SPV, WARP8_SPV, WARP9_SPV, WARP10_SPV, WARP11_SPV, WARP12_SPV, WARP13_SPV] {
+        let mut pipelines = Vec::with_capacity(20);
+        for frag in [
+            WARP_SPV, WARP2_SPV, WARP3_SPV, WARP4_SPV, WARP5_SPV, WARP6_SPV, WARP7_SPV,
+            WARP8_SPV, WARP9_SPV, WARP10_SPV, WARP11_SPV, WARP12_SPV, WARP13_SPV,
+            WARP14_SPV, WARP15_SPV, WARP16_SPV, WARP17_SPV, WARP18_SPV, WARP19_SPV, WARP20_SPV,
+        ] {
             pipelines.push(unsafe { create_pipeline(&device, &pipeline_layout, &render_pass, format, frag)? });
         }
+        // 5-cell wireframe pipeline (additive lines drawn over the feedback
+        // pass; own geometry + UBO layout).
+        let fivecell_pipeline = unsafe {
+            create_fivecell_pipeline(
+                &device,
+                &fivecell_pipeline_layout,
+                &render_pass,
+                format,
+                CELL_VERT_SPV,
+                CELL_FRAG_SPV,
+            )?
+        };
 
         // --- Uniform buffer -------------------------------------------------
         let uniform_size = std::mem::size_of::<UniformData>() as vk::DeviceSize;
@@ -315,35 +412,97 @@ impl Renderer {
             )?
         };
 
-        // --- Descriptor pool + set -----------------------------------------
+        // --- 5-cell overlay buffers (static geometry + DSP UBO) ------------
+        let vertex_data: Vec<u8> = fivecell::vertices()
+            .iter()
+            .flat_map(|v| v.iter())
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        let index_data: Vec<u8> = fivecell::edge_indices()
+            .iter()
+            .flat_map(|i| i.to_le_bytes())
+            .collect();
+        let (fivecell_vertex_buffer, fivecell_vertex_memory) = unsafe {
+            create_buffer(
+                &device,
+                instance.get_physical_device_memory_properties(physical_device),
+                vertex_data.len() as vk::DeviceSize,
+                vk::BufferUsageFlags::VERTEX_BUFFER,
+            )?
+        };
+        let (fivecell_index_buffer, fivecell_index_memory) = unsafe {
+            create_buffer(
+                &device,
+                instance.get_physical_device_memory_properties(physical_device),
+                index_data.len() as vk::DeviceSize,
+                vk::BufferUsageFlags::INDEX_BUFFER,
+            )?
+        };
+        let fivecell_uniform_size = fivecell::UNIFORM_SIZE as vk::DeviceSize;
+        let (fivecell_uniform_buffer, fivecell_uniform_memory) = unsafe {
+            create_buffer(
+                &device,
+                instance.get_physical_device_memory_properties(physical_device),
+                fivecell_uniform_size,
+                vk::BufferUsageFlags::UNIFORM_BUFFER,
+            )?
+        };
+        // Fill static vertex + index data once (the geometry never changes).
+        unsafe {
+            let vptr = device
+                .map_memory(
+                    fivecell_vertex_memory,
+                    0,
+                    vertex_data.len() as vk::DeviceSize,
+                    vk::MemoryMapFlags::empty(),
+                )
+                .expect("map 5-cell vertex buffer");
+            std::ptr::copy_nonoverlapping(vertex_data.as_ptr(), vptr as *mut u8, vertex_data.len());
+            device.unmap_memory(fivecell_vertex_memory);
+
+            let iptr = device
+                .map_memory(
+                    fivecell_index_memory,
+                    0,
+                    index_data.len() as vk::DeviceSize,
+                    vk::MemoryMapFlags::empty(),
+                )
+                .expect("map 5-cell index buffer");
+            std::ptr::copy_nonoverlapping(index_data.as_ptr(), iptr as *mut u8, index_data.len());
+            device.unmap_memory(fivecell_index_memory);
+        }
+
+        // --- Descriptor pool + sets (warp set + 5-cell set) -----------------
         let pool_sizes = [
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::UNIFORM_BUFFER,
-                descriptor_count: 1,
+                descriptor_count: 2,
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                descriptor_count: 1,
+                descriptor_count: 2,
             },
         ];
         let pool_info = vk::DescriptorPoolCreateInfo::builder()
             .pool_sizes(&pool_sizes)
-            .max_sets(1);
+            .max_sets(2);
         let desc_pool = unsafe {
             device
                 .create_descriptor_pool(&pool_info, None)
                 .map_err(|e| format!("desc pool: {e}"))?
         };
-        let desc_set_layouts = [desc_set_layout];
-        let desc_set = unsafe {
+        let desc_set_layouts = [desc_set_layout, fivecell_desc_set_layout];
+        let desc_sets = unsafe {
             device
                 .allocate_descriptor_sets(
                     &vk::DescriptorSetAllocateInfo::builder()
                         .descriptor_pool(desc_pool)
                         .set_layouts(&desc_set_layouts),
                 )
-                .map_err(first_error)?[0]
+                .map_err(first_error)?
         };
+        let desc_set = desc_sets[0];
+        let fivecell_desc_set = desc_sets[1];
 
         let ubo_info = vk::DescriptorBufferInfo::builder()
             .buffer(uniform_buffer)
@@ -355,8 +514,20 @@ impl Renderer {
             .image_view(feedback_view)
             .sampler(feedback_sampler)
             .build();
+        let old_img_info = vk::DescriptorImageInfo::builder()
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .image_view(feedback_old_view)
+            .sampler(feedback_sampler)
+            .build();
+        let c_ubo_info = vk::DescriptorBufferInfo::builder()
+            .buffer(fivecell_uniform_buffer)
+            .offset(0)
+            .range(fivecell_uniform_size)
+            .build();
         let ubo_infos = [ubo_info];
         let img_infos = [img_info];
+        let old_img_infos = [old_img_info];
+        let c_ubo_infos = [c_ubo_info];
         let writes = [
             vk::WriteDescriptorSet::builder()
                 .dst_set(desc_set)
@@ -369,6 +540,18 @@ impl Renderer {
                 .dst_binding(1)
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .image_info(&img_infos)
+                .build(),
+            vk::WriteDescriptorSet::builder()
+                .dst_set(desc_set)
+                .dst_binding(2)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&old_img_infos)
+                .build(),
+            vk::WriteDescriptorSet::builder()
+                .dst_set(fivecell_desc_set)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .buffer_info(&c_ubo_infos)
                 .build(),
         ];
         unsafe {
@@ -424,6 +607,8 @@ impl Renderer {
         // Seed the feedback texture (one-shot clear -> SHADER_READ_ONLY) so the
         // first frame samples valid, defined content instead of garbage.
         unsafe { seed_feedback(&device, graphics_queue, command_pool, feedback_image, extent)? };
+        // Seed the frozen frame copy too (texOld starts defined, not garbage).
+        unsafe { seed_feedback(&device, graphics_queue, command_pool, feedback_old_image, extent)? };
 
         Ok(Renderer {
             _entry: entry,
@@ -440,21 +625,33 @@ impl Renderer {
             swapchain_extent: extent,
             device,
             graphics_queue,
-            queue_family_index,
             feedback_image,
             feedback_memory,
             feedback_view,
             feedback_sampler,
+            feedback_old_image,
+            feedback_old_memory,
+            feedback_old_view,
+            crossfade: 0.0,
+            freeze_pending: false,
             render_pass,
             pipeline_layout,
             pipelines,
             shader_index: 0,
-            desc_set_layout,
-            desc_pool,
             desc_set,
-            uniform_buffer,
             uniform_memory,
             uniform_size,
+            fivecell_pipeline,
+            fivecell_pipeline_layout,
+            fivecell_desc_set,
+            fivecell_vertex_buffer,
+            fivecell_vertex_memory,
+            fivecell_index_buffer,
+            fivecell_index_memory,
+            fivecell_uniform_buffer,
+            fivecell_uniform_memory,
+            fivecell_uniform_size,
+            fivecell_active: false,
             command_pool,
             command_buffers,
             image_available,
@@ -495,6 +692,9 @@ impl Renderer {
             device.destroy_image(self.feedback_image, None);
             device.free_memory(self.feedback_memory, None);
             device.destroy_image_view(self.feedback_view, None);
+            device.destroy_image(self.feedback_old_image, None);
+            device.free_memory(self.feedback_old_memory, None);
+            device.destroy_image_view(self.feedback_old_view, None);
             self.swapchain_khr.destroy_swapchain(self.swapchain, None);
         }
 
@@ -567,9 +767,20 @@ impl Renderer {
             )?
         };
 
+        let (feedback_old_image, feedback_old_memory, feedback_old_view) = unsafe {
+            create_image(
+                &device,
+                self.instance_memory_props(),
+                extent,
+                format,
+                vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
+            )?
+        };
+
         // Seed the fresh feedback texture (clear -> SHADER_READ_ONLY) so the
         // resized loop starts from defined content rather than garbage.
         unsafe { seed_feedback(&device, self.graphics_queue, self.command_pool, feedback_image, extent)? };
+        unsafe { seed_feedback(&device, self.graphics_queue, self.command_pool, feedback_old_image, extent)? };
 
         unsafe {
             let img_info = vk::DescriptorImageInfo::builder()
@@ -577,13 +788,27 @@ impl Renderer {
                 .image_view(feedback_view)
                 .sampler(self.feedback_sampler)
                 .build();
+            let old_img_info = vk::DescriptorImageInfo::builder()
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .image_view(feedback_old_view)
+                .sampler(self.feedback_sampler)
+                .build();
             let img_infos = [img_info];
-            let writes = [vk::WriteDescriptorSet::builder()
-                .dst_set(self.desc_set)
-                .dst_binding(1)
-                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .image_info(&img_infos)
-                .build()];
+            let old_img_infos = [old_img_info];
+            let writes = [
+                vk::WriteDescriptorSet::builder()
+                    .dst_set(self.desc_set)
+                    .dst_binding(1)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(&img_infos)
+                    .build(),
+                vk::WriteDescriptorSet::builder()
+                    .dst_set(self.desc_set)
+                    .dst_binding(2)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(&old_img_infos)
+                    .build(),
+            ];
             device.update_descriptor_sets(&writes, &[]);
         }
 
@@ -595,6 +820,9 @@ impl Renderer {
         self.feedback_image = feedback_image;
         self.feedback_memory = feedback_memory;
         self.feedback_view = feedback_view;
+        self.feedback_old_image = feedback_old_image;
+        self.feedback_old_memory = feedback_old_memory;
+        self.feedback_old_view = feedback_old_view;
         self.frame_index = 0;
 
         log::info!("teeter: swapchain resized to {}x{}", extent.width, extent.height);
@@ -610,12 +838,43 @@ impl Renderer {
     /// Cycle to the next warp shader.
     pub fn next_shader(&mut self) {
         self.shader_index = (self.shader_index + 1) % self.pipelines.len();
+        self.crossfade = 1.0;
+        self.freeze_pending = true;
         log::info!("teeter: shader {} of {}", self.shader_index + 1, self.pipelines.len());
+    }
+
+    /// Toggle the 5-cell wireframe overlay (West / X button).
+    pub fn toggle_fivecell(&mut self) {
+        self.fivecell_active = !self.fivecell_active;
+        log::info!("teeter: 5-cell overlay -> {}", self.fivecell_active);
+    }
+
+    /// Is the 5-cell overlay currently active?
+    pub fn fivecell_active(&self) -> bool {
+        self.fivecell_active
     }
 
     /// Active warp shader index.
     pub fn shader_index(&self) -> usize {
         self.shader_index
+    }
+
+    /// Number of selectable warp shaders (for display purposes).
+    pub fn shader_count(&self) -> usize {
+        self.pipelines.len()
+    }
+
+    /// Display metadata for the active warp: (name, genre). Falls back to a
+    /// generic "warp N" tag for the classic shaders that have no name yet.
+    pub fn warp_meta(&self) -> Option<(&'static str, &'static str)> {
+        warp_meta(self.shader_index)
+    }
+
+    /// Jump to a specific shader index (used by --shader CLI arg).
+    pub fn set_shader_index(&mut self, idx: usize) {
+        if !self.pipelines.is_empty() {
+            self.shader_index = idx % self.pipelines.len();
+        }
     }
 
     pub fn render(&mut self, engine: &EngineState, input: &InputState, audio: &AudioFrame) {
@@ -649,6 +908,11 @@ impl Renderer {
         let mut data = UniformData::from((engine, input, audio));
         data.aspect = self.swapchain_extent.width as f32
             / self.swapchain_extent.height.max(1) as f32;
+        // Crossfade: a warp switch spikes `dissolve`, which the shaders treat
+        // as the mix weight against the frozen pre-switch frame (texOld). The
+        // spike decays each frame so switching melts rather than cuts.
+        data.dissolve = data.dissolve.max(self.crossfade);
+        self.crossfade *= 0.92;
         unsafe {
             let ptr = device
                 .map_memory(self.uniform_memory, 0, self.uniform_size, vk::MemoryMapFlags::empty())
@@ -666,6 +930,60 @@ impl Renderer {
             device
                 .begin_command_buffer(cb, &vk::CommandBufferBeginInfo::default())
                 .expect("begin cb");
+        }
+
+        // On a warp switch, freeze the current pre-switch frame into the
+        // texOld copy BEFORE the new shader draws, so the crossfade has
+        // something to melt out of.
+        if self.freeze_pending {
+            unsafe {
+                let src_old = self.feedback_image;
+                let dst_old = self.feedback_old_image;
+                transition_image(device, cb, src_old, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+                transition_image(device, cb, dst_old, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+                let freeze_region = vk::ImageBlit {
+                    src_subresource: vk::ImageSubresourceLayers {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        mip_level: 0,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    },
+                    src_offsets: [
+                        vk::Offset3D { x: 0, y: 0, z: 0 },
+                        vk::Offset3D {
+                            x: self.swapchain_extent.width as i32,
+                            y: self.swapchain_extent.height as i32,
+                            z: 1,
+                        },
+                    ],
+                    dst_subresource: vk::ImageSubresourceLayers {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        mip_level: 0,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    },
+                    dst_offsets: [
+                        vk::Offset3D { x: 0, y: 0, z: 0 },
+                        vk::Offset3D {
+                            x: self.swapchain_extent.width as i32,
+                            y: self.swapchain_extent.height as i32,
+                            z: 1,
+                        },
+                    ],
+                };
+                device.cmd_blit_image(
+                    cb,
+                    src_old,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    dst_old,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[freeze_region],
+                    vk::Filter::LINEAR,
+                );
+                transition_image(device, cb, src_old, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+                transition_image(device, cb, dst_old, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+            }
+            self.freeze_pending = false;
         }
 
         // Render pass: warp.frag samples feedback texture -> swapchain image.
@@ -710,6 +1028,57 @@ impl Renderer {
                 &[],
             );
             device.cmd_draw(cb, 3, 1, 0, 0);
+
+            // --- 5-cell wireframe overlay (additive, over the feedback) ----
+            if self.fivecell_active {
+                let aspect = self.swapchain_extent.width as f32
+                    / self.swapchain_extent.height.max(1) as f32;
+                let proj = glam::Mat4::perspective_rh_gl(
+                    std::f32::consts::FRAC_PI_4,
+                    aspect,
+                    0.1,
+                    100.0,
+                );
+                let view = glam::Mat4::look_at_rh(
+                    glam::Vec3::new(0.0, 0.0, 3.5),
+                    glam::Vec3::ZERO,
+                    glam::Vec3::new(0.0, 1.0, 0.0),
+                );
+                let mvp = proj * view;
+
+                // Upload the DSP UBO for this frame (audio-driven rotations).
+                let cu = DSPUniforms::from_audio(mvp, audio, data.i_time);
+                let cptr = device
+                    .map_memory(
+                        self.fivecell_uniform_memory,
+                        0,
+                        self.fivecell_uniform_size,
+                        vk::MemoryMapFlags::empty(),
+                    )
+                    .expect("map 5-cell uniform memory");
+                std::ptr::copy_nonoverlapping(
+                    (&cu as *const DSPUniforms) as *const u8,
+                    cptr as *mut u8,
+                    std::mem::size_of::<DSPUniforms>(),
+                );
+                device.unmap_memory(self.fivecell_uniform_memory);
+
+                device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, self.fivecell_pipeline);
+                device.cmd_bind_descriptor_sets(
+                    cb,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.fivecell_pipeline_layout,
+                    0,
+                    &[self.fivecell_desc_set],
+                    &[],
+                );
+                let vbs = [self.fivecell_vertex_buffer];
+                let offsets = [0u64];
+                device.cmd_bind_vertex_buffers(cb, 0, &vbs, &offsets);
+                device.cmd_bind_index_buffer(cb, self.fivecell_index_buffer, 0, vk::IndexType::UINT16);
+                device.cmd_draw_indexed(cb, 20, 1, 0, 0, 0);
+            }
+
             device.cmd_end_render_pass(cb);
 
             // Blit the freshly rendered swapchain image into the feedback tex.
@@ -793,21 +1162,30 @@ impl Renderer {
 
 impl From<(&EngineState, &InputState, &AudioFrame)> for UniformData {
     fn from((e, i, a): (&EngineState, &InputState, &AudioFrame)) -> Self {
+        // Consume the engine's *blended* motion values (genre-driven auto
+        // motion mixed with whatever the player is actually doing) so the
+        // seeds / decay / manual-weight logic in EngineState actually reach the
+        // shader instead of being bypassed by raw input values.
         let u = e.uniforms(i, a);
         Self {
             i_time: u.i_time,
-            bass: a.bass,
-            mid: a.mid,
-            treble: a.treble,
-            beat: a.beat,
-            zoom: i.zoom,
-            warp_x: i.warp_x,
-            warp_y: i.warp_y,
-            rotate: i.rotate,
-            dissolve: i.dissolve,
-            palette: i.palette,
+            bass: u.bass,
+            mid: u.mid,
+            treble: u.treble,
+            beat: u.beat,
+            zoom: u.zoom,
+            warp_x: u.warp_x,
+            warp_y: u.warp_y,
+            rotate: u.rotate,
+            dissolve: u.dissolve,
+            palette: u.palette,
             preset_seed: u.preset_seed,
             aspect: 1.0,
+            sub_bass: u.sub_bass,
+            centroid: u.centroid,
+            crest: u.crest,
+            flux: u.flux,
+            rolloff: u.rolloff,
         }
     }
 }
@@ -817,6 +1195,7 @@ impl From<(&EngineState, &InputState, &AudioFrame)> for UniformData {
 
 const UB_BINDING: u32 = 0;
 const TEX_BINDING: u32 = 1;
+const TEX_OLD_BINDING: u32 = 2;
 
 fn ubo_binding() -> vk::DescriptorSetLayoutBinding {
     vk::DescriptorSetLayoutBinding::builder()
@@ -830,6 +1209,15 @@ fn ubo_binding() -> vk::DescriptorSetLayoutBinding {
 fn feedback_binding() -> vk::DescriptorSetLayoutBinding {
     vk::DescriptorSetLayoutBinding::builder()
         .binding(TEX_BINDING)
+        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+        .descriptor_count(1)
+        .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+        .build()
+}
+
+fn tex_old_binding() -> vk::DescriptorSetLayoutBinding {
+    vk::DescriptorSetLayoutBinding::builder()
+        .binding(TEX_OLD_BINDING)
         .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
         .descriptor_count(1)
         .stage_flags(vk::ShaderStageFlags::FRAGMENT)
@@ -1031,12 +1419,24 @@ unsafe fn create_desc_set_layout(
     device: &ash::Device,
     ubo: vk::DescriptorSetLayoutBinding,
     tex: vk::DescriptorSetLayoutBinding,
+    tex_old: vk::DescriptorSetLayoutBinding,
 ) -> Result<vk::DescriptorSetLayout, String> {
-    let bindings = [ubo, tex];
+    let bindings = [ubo, tex, tex_old];
     let info = vk::DescriptorSetLayoutCreateInfo::builder().bindings(&bindings);
     device
         .create_descriptor_set_layout(&info, None)
         .map_err(|e| format!("desc set layout: {e}"))
+}
+
+unsafe fn create_desc_set_layout_ubo_only(
+    device: &ash::Device,
+    ubo: vk::DescriptorSetLayoutBinding,
+) -> Result<vk::DescriptorSetLayout, String> {
+    let bindings = [ubo];
+    let info = vk::DescriptorSetLayoutCreateInfo::builder().bindings(&bindings);
+    device
+        .create_descriptor_set_layout(&info, None)
+        .map_err(|e| format!("5-cell desc set layout: {e}"))
 }
 
 unsafe fn create_pipeline(
@@ -1151,6 +1551,143 @@ unsafe fn create_pipeline(
     Ok(pipeline)
 }
 
+unsafe fn create_fivecell_pipeline(
+    device: &ash::Device,
+    pipeline_layout: &vk::PipelineLayout,
+    render_pass: &vk::RenderPass,
+    _format: vk::Format,
+    vert_spv: &[u8],
+    frag_spv: &[u8],
+) -> Result<vk::Pipeline, String> {
+    let vert_code = to_u32s(vert_spv);
+    let vert_module = device
+        .create_shader_module(
+            &vk::ShaderModuleCreateInfo::builder().code(&vert_code),
+            None,
+        )
+        .map_err(|e| format!("5-cell vert module: {e}"))?;
+    let frag_code = to_u32s(frag_spv);
+    let frag_module = device
+        .create_shader_module(
+            &vk::ShaderModuleCreateInfo::builder().code(&frag_code),
+            None,
+        )
+        .map_err(|e| format!("5-cell frag module: {e}"))?;
+
+    let entry = cstring("main");
+    let stages = [
+        vk::PipelineShaderStageCreateInfo::builder()
+            .stage(vk::ShaderStageFlags::VERTEX)
+            .module(vert_module)
+            .name(&entry)
+            .build(),
+        vk::PipelineShaderStageCreateInfo::builder()
+            .stage(vk::ShaderStageFlags::FRAGMENT)
+            .module(frag_module)
+            .name(&entry)
+            .build(),
+    ];
+
+    // Per-vertex 4D position (vec4, 16-byte stride).
+    let binding = vk::VertexInputBindingDescription::builder()
+        .binding(0)
+        .stride(16)
+        .input_rate(vk::VertexInputRate::VERTEX)
+        .build();
+    let attribute = vk::VertexInputAttributeDescription::builder()
+        .binding(0)
+        .location(0)
+        .format(vk::Format::R32G32B32A32_SFLOAT)
+        .offset(0)
+        .build();
+    let bindings = [binding];
+    let attributes = [attribute];
+    let vertex_input = vk::PipelineVertexInputStateCreateInfo::builder()
+        .vertex_binding_descriptions(&bindings)
+        .vertex_attribute_descriptions(&attributes)
+        .build();
+    let input_asm = vk::PipelineInputAssemblyStateCreateInfo::builder()
+        .topology(vk::PrimitiveTopology::LINE_LIST)
+        .build();
+
+    // Dynamic viewport/scissor (set per frame, matches the warp pipeline).
+    let viewport = vk::Viewport {
+        x: 0.0,
+        y: 0.0,
+        width: 1920.0,
+        height: 1080.0,
+        min_depth: 0.0,
+        max_depth: 1.0,
+    };
+    let scissor = vk::Rect2D {
+        offset: vk::Offset2D { x: 0, y: 0 },
+        extent: vk::Extent2D { width: 1920, height: 1080 },
+    };
+    let viewports = [viewport];
+    let scissors = [scissor];
+    let viewport_state = vk::PipelineViewportStateCreateInfo::builder()
+        .viewports(&viewports)
+        .scissors(&scissors)
+        .build();
+    let raster = vk::PipelineRasterizationStateCreateInfo::builder()
+        .depth_clamp_enable(false)
+        .rasterizer_discard_enable(false)
+        .polygon_mode(vk::PolygonMode::FILL)
+        .cull_mode(vk::CullModeFlags::NONE)
+        .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+        .depth_bias_enable(false)
+        .line_width(1.0)
+        .build();
+    let msaa = vk::PipelineMultisampleStateCreateInfo::builder()
+        .rasterization_samples(vk::SampleCountFlags::TYPE_1)
+        .build();
+    // Additive blend: the wireframe glows over the feedback background.
+    let blend_attach = vk::PipelineColorBlendAttachmentState::builder()
+        .blend_enable(true)
+        .src_color_blend_factor(vk::BlendFactor::ONE)
+        .dst_color_blend_factor(vk::BlendFactor::ONE)
+        .color_blend_op(vk::BlendOp::ADD)
+        .src_alpha_blend_factor(vk::BlendFactor::ONE)
+        .dst_alpha_blend_factor(vk::BlendFactor::ZERO)
+        .alpha_blend_op(vk::BlendOp::ADD)
+        .color_write_mask(
+            vk::ColorComponentFlags::R
+                | vk::ColorComponentFlags::G
+                | vk::ColorComponentFlags::B
+                | vk::ColorComponentFlags::A,
+        )
+        .build();
+    let blend_attachments = [blend_attach];
+    let blend = vk::PipelineColorBlendStateCreateInfo::builder()
+        .attachments(&blend_attachments)
+        .build();
+    let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+    let dynamic_state = vk::PipelineDynamicStateCreateInfo::builder()
+        .dynamic_states(&dynamic_states)
+        .build();
+    let pipeline_info = vk::GraphicsPipelineCreateInfo::builder()
+        .stages(&stages)
+        .vertex_input_state(&vertex_input)
+        .input_assembly_state(&input_asm)
+        .viewport_state(&viewport_state)
+        .rasterization_state(&raster)
+        .multisample_state(&msaa)
+        .color_blend_state(&blend)
+        .dynamic_state(&dynamic_state)
+        .layout(*pipeline_layout)
+        .render_pass(*render_pass)
+        .subpass(0)
+        .build();
+
+    let pipeline = device
+        .create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
+        .map_err(|(_, e)| format!("5-cell pipeline: {e}"))?[0];
+
+    device.destroy_shader_module(vert_module, None);
+    device.destroy_shader_module(frag_module, None);
+    Ok(pipeline)
+}
+
 unsafe fn transition_image(
     device: &ash::Device,
     cb: vk::CommandBuffer,
@@ -1176,6 +1713,12 @@ unsafe fn transition_image(
         }
         (vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, vk::ImageLayout::TRANSFER_DST_OPTIMAL) => {
             (vk::AccessFlags::SHADER_READ, vk::AccessFlags::TRANSFER_WRITE)
+        }
+        (vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL) => {
+            (vk::AccessFlags::SHADER_READ, vk::AccessFlags::TRANSFER_READ)
+        }
+        (vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL) => {
+            (vk::AccessFlags::TRANSFER_READ, vk::AccessFlags::SHADER_READ)
         }
         _ => (vk::AccessFlags::NONE, vk::AccessFlags::NONE),
     };

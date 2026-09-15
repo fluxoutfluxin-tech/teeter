@@ -1,6 +1,6 @@
 #version 450
 
-// "Liquid" — domain-warped metaball blobs driven by mid/treble.
+// "Liquid" â€” domain-warped metaball blobs driven by mid/treble.
 //
 // Same descriptor contract as warp.frag (set 0: UBO binding 0, texPrev
 // binding 1, aspect in the uniform block), so it plugs into the existing
@@ -118,5 +118,6 @@ void main() {
 
     // Filmic finish: preserves detail, tames highlights (no flat white).
     shifted = teeter_colorize(shifted, energy);
+    shifted = teeter_crossfade(shifted, tex, u.dissolve);
     outColor = vec4(shifted, 1.0);
 }

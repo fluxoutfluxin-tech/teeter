@@ -48,3 +48,17 @@ vec3 teeter_colorize(vec3 shifted, float energy) {
     shifted = mix(vec3(luma), shifted, 0.90);
     return clamp(shifted, 0.0, 1.0);
 }
+
+// Previous-warp "frozen old frame" sampler, used by teeter_crossfade for a
+// smooth transition when the active warp changes. Bound to set 0, binding 2
+// (matches the Rust renderer's second feedback texture).
+layout(set = 0, binding = 2) uniform sampler2D texOld;
+
+// Crossfade against the window that was frozen just before a warp switch.
+// `w` is a 0..1 mix weight (0 = pure live feedback, 1 = pure old frame) that
+// the renderer pegs high on a switch and then decays, so changing warps melts
+// the image instead of cutting to black.
+vec3 teeter_crossfade(vec3 c, vec2 tex, float w) {
+    vec3 old = texture(texOld, tex).rgb;
+    return mix(c, old, clamp(w, 0.0, 1.0));
+}

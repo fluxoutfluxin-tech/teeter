@@ -1,6 +1,6 @@
 #version 450
 
-// "Surf / planar waves" — a flat X/Y shearing ocean rather than a polar fold.
+// "Surf / planar waves" â€” a flat X/Y shearing ocean rather than a polar fold.
 //
 // Same descriptor contract as warp.frag (set 0 binding 0 = UBO, binding 1 =
 // texPrev), so it plugs into the existing pipeline with no renderer changes.
@@ -90,5 +90,6 @@ void main() {
     // Filmic finish: preserves detail, tames highlights (no flat white).
     float energy = clamp(0.84*u.bass + 0.24*u.mid + 0.24*u.treble + 0.66*u.beat, 0.0, 1.0);
     shifted = teeter_colorize(shifted, energy);
+    shifted = teeter_crossfade(shifted, tex, u.dissolve);
     outColor = vec4(shifted, 1.0);
 }

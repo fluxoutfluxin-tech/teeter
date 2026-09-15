@@ -34,6 +34,9 @@ pub struct App {
     /// Index into the trip-engine preset list; advanced alongside the visual
     /// preset so the synth and the shader change together.
     synth_preset: usize,
+    /// Optional CLI boot targets (`--shader N` / `--preset N`).
+    pub boot_shader: Option<usize>,
+    pub boot_preset: Option<usize>,
     pub start: std::time::Instant,
     /// Last frame's elapsed time (for dt).
     last_elapsed: f32,
@@ -51,6 +54,8 @@ impl Default for App {
             controller: Controller::new(),
             audio: Box::new(crate::audio::SynthAudio::default()),
             synth_preset: 0,
+            boot_shader: None,
+            boot_preset: None,
             start: std::time::Instant::now(),
             last_elapsed: 0.0,
             touch_down: None,
@@ -77,6 +82,27 @@ impl ApplicationHandler for App {
 
         self.window = Some(window);
         self.renderer = Some(renderer);
+
+        // Apply CLI boot targets (--shader N / --preset N).
+        if let Some(s) = self.boot_shader.take() {
+            if let Some(r) = &mut self.renderer {
+                r.set_shader_index(s);
+                self.update_title();
+            }
+        }
+        if let Some(p) = self.boot_preset.take() {
+            self.engine.set_preset(p as u32);
+            let n = trip_engine::presets::NAMES.len();
+            if n > 0 {
+                self.synth_preset = (p as usize) % n;
+                if let Some(h) = self.audio.handle() {
+                    let preset = trip_engine::presets::at(self.synth_preset);
+                    log::info!("app: boot preset -> {} ({})", preset.name, p);
+                    h.request_preset(preset);
+                }
+            }
+            self.update_title();
+        }
 
         if let Some(w) = &self.window {
             w.request_redraw();
@@ -145,10 +171,19 @@ impl ApplicationHandler for App {
             // Advance the trip-engine synth preset in lockstep so the sound
             // and the visuals change together.
             self.advance_synth_preset();
+            self.update_title();
         }
         if self.controller.state.next_shader_edge {
             if let Some(renderer) = &mut self.renderer {
                 renderer.next_shader();
+            }
+            // B3: re-seed so each warp lands on a fresh colour character.
+            self.engine.reshuffle_seed();
+            self.update_title();
+        }
+        if self.controller.state.fivecell_toggle_edge {
+            if let Some(renderer) = &mut self.renderer {
+                renderer.toggle_fivecell();
             }
         }
         if self.controller.state.toggle_fullscreen_edge {
@@ -159,6 +194,19 @@ impl ApplicationHandler for App {
         }
         if self.controller.state.live_mix_dec_edge {
             self.adjust_live_mix(-0.1);
+        }
+        // Right trigger = synth master gain. Only poke while pulled so a
+        // released trigger holds the last level instead of dropping to silence.
+        let master = self.controller.state.master_axis;
+        if master > 0.01 {
+            if let Some(h) = self.audio.handle() {
+                let mut ctl = h.snapshot();
+                if (ctl.master - master as f64).abs() > 1e-4 {
+                    ctl.master = master as f64;
+                    h.set_params(ctl);
+                    log::info!("app: master gain -> {:.2}", master);
+                }
+            }
         }
 
         // Auto presets are OFF — presets only change via the A button (See
@@ -194,6 +242,7 @@ impl App {
                     // Quick tap -> next preset (synth + visuals together).
                     self.engine.next_preset();
                     self.advance_synth_preset();
+                    self.update_title();
                 }
             }
             _ => {}
@@ -241,5 +290,23 @@ impl App {
             // which drives the swapchain rebuild. No manual recreate here.
             w.request_redraw();
         }
+    }
+
+    /// Reflect the active warp in the title bar (used on shader switches and
+    /// preset changes so the current look is always visible at a glance).
+    fn update_title(&mut self) {
+        let Some(w) = &self.window else { return };
+        let (idx, total) = self
+            .renderer
+            .as_ref()
+            .map(|r| (r.shader_index() + 1, r.shader_count()))
+            .unwrap_or((0, 0));
+        let name = self
+            .renderer
+            .as_ref()
+            .and_then(|r| r.warp_meta())
+            .map(|(n, g)| format!(" — {n} ({g})"))
+            .unwrap_or_default();
+        let _ = w.set_title(&format!("teeter — warp {idx}/{total}{name}"));
     }
 }

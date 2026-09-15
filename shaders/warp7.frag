@@ -1,6 +1,6 @@
 #version 450
 
-// "Confetti embers" — scattered spinning sprites that spark on the beat.
+// "Confetti embers" â€” scattered spinning sprites that spark on the beat.
 //
 // Same descriptor contract as warp.frag (set 0: UBO binding 0, texPrev
 // binding 1, aspect in the uniform block), so it plugs into the existing
@@ -9,7 +9,7 @@
 // Look: the UV is quantized into a coarse grid of "cells"; each cell gets a
 // per-preset hash that offsets a small sprite. On a beat the sprites scatter
 // (and the feedback streaks them), so embers fly out of the center and settle
-// back between beats — like a machine-lights confetti burst that ghosts
+// back between beats â€” like a machine-lights confetti burst that ghosts
 // through the feedback loop.
 
 #include "teeter_common.h"
@@ -102,5 +102,6 @@ void main() {
 
     // Filmic finish: preserves detail, tames highlights (no flat white).
     shifted = teeter_colorize(shifted, energy);
+    shifted = teeter_crossfade(shifted, tex, u.dissolve);
     outColor = vec4(shifted, 1.0);
 }
